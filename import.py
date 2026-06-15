@@ -14,7 +14,7 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import json, time, html, requests
+import json, time, html, requests, functools
 from datetime import datetime
 import ipywidgets as widgets
 from IPython.display import display, HTML
@@ -135,12 +135,10 @@ DEFAULT_BRANCH_NAME = f"databricks-import/{_user_slug}-{RUN_TS}"
 
 # ============================================================ shared state (source side)
 results = []            # every object generated from the chosen schemas
-selected_results = []   # subset the user kept checked in Step 2
-combined_ddl = ""       # DDL payload built from selected_results only
+selected = {}           # object_key -> bool  (selection lives here, NOT in widgets, so it scales)
 catalog = ""
 selected_schemas = []
-_object_rows = []       # [(checkbox, result_dict)]
-_bulk = {"active": False}
+RENDER_CAP = 300        # max checkbox rows rendered at once; filter to reach the rest
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
@@ -165,10 +163,21 @@ generate_btn = widgets.Button(description="Generate DDL", button_style="primary"
 source_out   = widgets.Output()
 
 # ============================================================ STEP 2 controls (object picker)
+filter_w         = widgets.Text(description="Filter", placeholder="name contains… (e.g. fact_, dim_, schema.table) — press Enter",
+                                continuous_update=False, layout=widgets.Layout(width="420px"), style=_S)
 objects_summary  = widgets.HTML("Generate DDL in Step 1 to list objects.")
 objects_container= widgets.VBox([])
-select_all_btn   = widgets.Button(description="Select all", layout=widgets.Layout(width="110px"))
-select_none_btn  = widgets.Button(description="Deselect all", layout=widgets.Layout(width="110px"))
+options_label    = widgets.Label("Options", layout=widgets.Layout(width="120px", display="flex",
+                                                                  justify_content="flex-end"))
+select_all_btn   = widgets.Button(description="Select all", layout=widgets.Layout(width="140px"))
+select_none_btn  = widgets.Button(description="Deselect all", layout=widgets.Layout(width="140px"))
+continue_btn     = widgets.Button(description="Preview DDL to Continue ▸", button_style="primary",
+                                  layout=widgets.Layout(width="240px"))
+continue_status  = widgets.HTML("")
+# ---- Step 3 (DDL confirmation) ----
+preview_out      = widgets.Output()
+confirm_btn      = widgets.Button(description="Confirm & Configure Destination ▸", button_style="success",
+                                  layout=widgets.Layout(width="280px"))
 
 def on_catalog_change(_=None):
     try:
@@ -208,8 +217,13 @@ def on_generate(_):
               f"{len(skipped)} skipped/failed. Review and (de)select them in Step 2.")
         for s, t, reason in skipped[:25]:
             print(f"  - skipped {s}.{t}: {reason[:120]}")
-    build_object_rows()
-    recompute_selection()
+    global selected
+    selected = {_key(r): True for r in results}   # default: everything selected
+    filter_w.value = ""
+    render_objects()
+    update_counts()
+    if results:
+        open_step(1)   # collapse Step 1, open Step 2
 
 def _object_kind(ddl):
     head = (" " + ddl[:80].upper() + " ")
@@ -221,54 +235,105 @@ def _object_kind(ddl):
         return "PROCEDURE"
     return "TABLE"
 
-def build_object_rows():
-    """Render one selectable row per generated object, grouped by schema, DDL behind a caret."""
-    global _object_rows
-    _object_rows = []
+# ---- selection helpers (operate on the `selected` dict, never on widget state) ----
+def _key(r):
+    return f"{r['schema']}.{r['table']}"
+
+def current_matches():
+    """Objects matching the filter box (case-insensitive substring on schema.table · kind)."""
+    q = filter_w.value.strip().lower()
+    if not q:
+        return results
+    return [r for r in results if q in f"{_key(r)} {_object_kind(r['ddl'])}".lower()]
+
+def selected_count():
+    return sum(1 for r in results if selected.get(_key(r), False))
+
+def build_payload():
+    return "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['table']}\n{r['ddl']};\n"
+                     for r in results if selected.get(_key(r), False))
+
+def on_toggle(change, key):
+    selected[key] = change["new"]
+    update_counts()
+
+def update_counts(*_):
+    """Cheap: refresh counters + the destination review. Does NOT build the DDL payload."""
+    total = len(results)
+    objects_summary.value = (f"<b>{selected_count()}</b> of {total} object(s) selected"
+                             if total else "Generate DDL in Step 1 to list objects.")
+    render_review()
+
+def render_objects(*_):
+    """Render only the filtered slice, capped at RENDER_CAP rows, grouped by schema."""
     if not results:
         objects_container.children = []
         return
+    matches = current_matches()
     by_schema = {}
-    for r in results:
+    for r in matches:
         by_schema.setdefault(r["schema"], []).append(r)
-    children = []
+    children, shown, capped = [], 0, False
     for schema in sorted(by_schema):
+        objs = sorted(by_schema[schema], key=lambda x: x["table"].lower())
+        sel_n = sum(1 for r in objs if selected.get(_key(r), False))
         children.append(widgets.HTML(
-            f"<div style='font-weight:600;margin:8px 0 2px'>{html.escape(catalog)}.{html.escape(schema)}</div>"))
-        for r in sorted(by_schema[schema], key=lambda x: x["table"].lower()):
-            chk = widgets.Checkbox(value=True, indent=False,
+            f"<div style='font-weight:600;margin:8px 0 2px'>{html.escape(catalog)}.{html.escape(schema)} "
+            f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>"))
+        for r in objs:
+            if shown >= RENDER_CAP:
+                capped = True
+                break
+            k = _key(r)
+            chk = widgets.Checkbox(value=selected.get(k, True), indent=False,
                                    description=f"{r['table']}   ·   {_object_kind(r['ddl'])}",
                                    layout=widgets.Layout(width="380px", margin="0"))
-            chk.observe(lambda c: recompute_selection(), names="value")
+            chk.observe(functools.partial(on_toggle, key=k), names="value")
             details = widgets.HTML(
                 "<details style='margin:0 0 4px 26px'>"
                 "<summary style='cursor:pointer;font-size:12px;color:#555'>show DDL</summary>"
                 "<div style='max-height:300px;overflow:auto;border:1px solid #ddd;padding:6px;"
                 "font-family:monospace;white-space:pre;font-size:12px;margin-top:4px'>"
                 f"{html.escape(r['ddl'])}</div></details>")
-            _object_rows.append((chk, r))
             children.append(widgets.VBox([chk, details], layout=widgets.Layout(margin="0")))
+            shown += 1
+        if capped:
+            break
+    if capped:
+        children.append(widgets.HTML(
+            f"<div style='color:#a60;margin-top:6px'>Showing first {RENDER_CAP} of {len(matches)} "
+            f"matching objects — refine the Filter to see more. Select / Deselect all still apply "
+            f"to all {len(matches)} matches.</div>"))
     objects_container.children = children
 
-def recompute_selection(*_):
-    """Rebuild the submission payload from the currently checked objects."""
-    global combined_ddl, selected_results
-    if _bulk["active"]:
-        return
-    selected_results = [r for chk, r in _object_rows if chk.value]
-    combined_ddl = "\n".join(
-        f"-- {r['catalog']}.{r['schema']}.{r['table']}\n{r['ddl']};\n" for r in selected_results)
-    total = len(_object_rows)
-    objects_summary.value = (f"<b>{len(selected_results)}</b> of {total} object(s) selected"
-                             if total else "Generate DDL in Step 1 to list objects.")
-    render_review()
+def set_all_filtered(value):
+    """Apply to every object matching the current filter (not just the rendered slice)."""
+    for r in current_matches():
+        selected[_key(r)] = value
+    render_objects()
+    update_counts()
 
-def set_all(value):
-    _bulk["active"] = True
-    for chk, _ in _object_rows:
-        chk.value = value
-    _bulk["active"] = False
-    recompute_selection()
+def on_preview_continue(_):
+    """Step 2 -> Step 3: render the selected DDL into the confirmation panel and open it."""
+    continue_status.value = ""
+    if selected_count() == 0:
+        continue_status.value = "<span style='color:#c00'>Select at least one object to continue.</span>"
+        return
+    preview_out.clear_output()
+    with preview_out:
+        n = selected_count()
+        payload = build_payload()
+        display(HTML(
+            f"<div style='font-size:12px;color:#555;margin-bottom:4px'>"
+            f"DDL for <b>{n}</b> selected object(s) — review, then confirm:</div>"
+            "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
+            "font-family:monospace;white-space:pre;font-size:12px'>"
+            f"{html.escape(payload)}</div>"))
+    open_step(2)
+
+def on_confirm(_):
+    """Step 3 -> Step 4: open the destination panel."""
+    open_step(3)
 
 # ============================================================ DESTINATION controls
 token_w        = widgets.Password(description="API Token", layout=widgets.Layout(**_W), style=_S)
@@ -318,7 +383,7 @@ def name_conflict():
 def render_review(*_):
     review_out.clear_output()
     with review_out:
-        n = len(selected_results)
+        n = selected_count()
         total = len(results)
         dest = "(choose a project)"
         if project_dd.value == NEW_PROJECT:
@@ -340,13 +405,9 @@ def render_review(*_):
             f"{' · strictMode' if strict_w.value else ''}"
             f"{(' · diagram: ' + html.escape(diagram_w.value)) if diagram_w.value.strip() else ''}"
             f"{warn_html}"
-            "<details style='margin-top:8px'>"
-            f"<summary style='cursor:pointer'>Show DDL to be submitted ({n} object(s))</summary>"
-            "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
-            "font-family:monospace;white-space:pre;font-size:12px;margin-top:6px'>"
-            f"{html.escape(combined_ddl) or '(no DDL — click Generate DDL)'}</div></details>"
+            "<div style='margin-top:6px;color:#777;font-size:12px'>Use “Preview DDL” in Step 2 to see the exact payload.</div>"
             "</div>"))
-    submit_btn.disabled = (not bool(project_dd.value)) or bool(name_conflict()) or (not combined_ddl)
+    submit_btn.disabled = (not bool(project_dd.value)) or bool(name_conflict()) or (selected_count() == 0)
 
 def refresh_conditional_fields():
     is_new = project_dd.value == NEW_PROJECT
@@ -427,8 +488,9 @@ def on_submit(_):
         token = token_w.value.strip()
         if not token:
             print("Enter your API token."); return
-        if not combined_ddl:
-            print("No DDL to send — pick schema(s) and click Generate DDL first."); return
+        if selected_count() == 0:
+            print("No objects selected — generate DDL and select objects in Step 2 first."); return
+        payload = build_payload()
         conflict = name_conflict()
         if conflict:
             print(f"⛔ {conflict}"); return
@@ -443,7 +505,7 @@ def on_submit(_):
                 if not created_name:
                     print("Enter a name for the new project."); return
                 print(f"Creating new project '{created_name}' ...")
-                r = create_project(token, created_name, combined_ddl, db_type_dd.value, rev_name, diagram)
+                r = create_project(token, created_name, payload, db_type_dd.value, rev_name, diagram)
             else:
                 pid = _state["projects"][project_dd.value]
                 branch_id = None
@@ -465,7 +527,7 @@ def on_submit(_):
                 where = f"branch {branch_id}" if branch_id else "main"
                 tgt = f"revision {rev_id}" if rev_id else "latest"
                 print(f"Creating revision on {where} ({tgt}) ...")
-                r = create_revision(token, pid, combined_ddl, rev_name, strict_w.value, branch_id, rev_id, diagram)
+                r = create_revision(token, pid, payload, rev_name, strict_w.value, branch_id, rev_id, diagram)
 
             if r.status_code in (200, 202):
                 print(f"✅ {r.status_code} — accepted. SqlDBM is processing the import.")
@@ -504,8 +566,11 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 # ============================================================ wire up
 catalog_dd.observe(on_catalog_change, names="value")
 generate_btn.on_click(on_generate)
-select_all_btn.on_click(lambda b: set_all(True))
-select_none_btn.on_click(lambda b: set_all(False))
+filter_w.observe(render_objects, names="value")
+select_all_btn.on_click(lambda b: set_all_filtered(True))
+select_none_btn.on_click(lambda b: set_all_filtered(False))
+continue_btn.on_click(on_preview_continue)
+confirm_btn.on_click(on_confirm)
 connect_btn.on_click(on_connect)
 submit_btn.on_click(on_submit)
 project_dd.observe(on_project_change, names="value")
@@ -526,19 +591,59 @@ on_catalog_change()
 refresh_conditional_fields()
 render_review()
 
-display(widgets.VBox([
-    widgets.HTML("<h4 style='margin:4px 0'>1 · Configure Source Catalog and Schema(s)</h4>"),
-    catalog_dd, schema_sel, generate_btn, source_out,
-    widgets.HTML("<hr style='margin:10px 0'>"),
-    widgets.HTML("<h4 style='margin:4px 0'>2 · Configure Objects to Import</h4>"),
-    widgets.HBox([select_all_btn, select_none_btn, objects_summary]),
+STEP_TITLES = [
+    "1 · Configure Source Catalog and Schema(s)",
+    "2 · Configure Objects to Import",
+    "3 · DDL Confirmation",
+    "4 · Configure Destination Project",
+]
+_step1 = widgets.VBox([catalog_dd, schema_sel, generate_btn, source_out])
+_step2 = widgets.VBox([
+    widgets.HBox([filter_w, continue_btn, continue_status]),
+    widgets.HBox([options_label, select_all_btn, select_none_btn, objects_summary]),
     objects_container,
-    widgets.HTML("<hr style='margin:10px 0'>"),
-    widgets.HTML("<h4 style='margin:4px 0'>3 · Configure Destination Project</h4>"),
+])
+_step3 = widgets.VBox([
+    widgets.HTML("<div style='font-size:13px'>Confirm the DDL below is what you want to import, "
+                 "then continue to choose the destination.</div>"),
+    preview_out, confirm_btn,
+])
+_step4 = widgets.VBox([
     widgets.HBox([token_w, connect_btn]), status_out,
     project_dd, new_proj_name, db_type_dd,
     cw_chk, branch_dd, new_branch_w,
     update_dd, revision_name_w, diagram_w, strict_w,
     widgets.HTML("<hr style='margin:8px 0'>"),
     review_out, submit_btn, result_out,
-]))
+])
+step_contents = [_step1, _step2, _step3, _step4]
+
+# Header buttons double as the (always-visible) section titles.
+step_headers = [widgets.Button(description=t, layout=widgets.Layout(display="flex", width="100%", margin="2px 0", align_items="flex-start"))
+                for t in STEP_TITLES]
+_open = {"i": 0}
+
+def open_step(i):
+    """Open panel i (collapsing the rest); pass -1 to collapse all. Headers stay visible either way."""
+    _open["i"] = i
+    for j, (h, c) in enumerate(zip(step_headers, step_contents)):
+        is_open = (j == i)
+        c.layout.display = "" if is_open else "none"
+        h.description = ("▾  " if is_open else "▸  ") + STEP_TITLES[j]
+        h.style.button_color = "#dbe6ff" if is_open else "#f2f2f2"
+
+def _header_handler(i):
+    def _h(_):
+        open_step(-1 if _open["i"] == i else i)   # click the open one to collapse it
+    return _h
+
+for _i, _h in enumerate(step_headers):
+    _h.on_click(_header_handler(_i))
+
+open_step(0)   # start on Step 1; the rest collapse but their titles remain visible
+
+_rows = []
+for _h, _c in zip(step_headers, step_contents):
+    _rows.append(_h)
+    _rows.append(_c)
+display(widgets.VBox(_rows))
