@@ -663,13 +663,14 @@ preflight_btn = widgets.Button(description="Re-run environment checks",
 preflight_out = widgets.Output()
 
 def _probe(url, timeout=5):
+    """Return (reachable, status_code|None, detail). reachable=True if any HTTP response came back."""
     try:
         r = requests.get(url, timeout=timeout)
-        return True, f"reachable (HTTP {r.status_code})"
+        return True, r.status_code, f"HTTP {r.status_code}"
     except requests.exceptions.SSLError:
-        return False, "TLS/SSL error — likely an inspecting proxy or certificate issue"
+        return False, None, "TLS/SSL error — likely an inspecting proxy or certificate issue"
     except requests.exceptions.RequestException as e:
-        return False, f"unreachable ({type(e).__name__})"
+        return False, None, f"unreachable ({type(e).__name__})"
 
 def _runtime_info():
     try:
@@ -698,33 +699,70 @@ def run_preflight(_=None):
     with preflight_out:
         dbr, compute = _runtime_info()
         cur, cats, uc, uc_note = _catalog_info()
-        ok_sql, sql_detail = _probe(SQLDBM_BASE + "/projects")   # 401 still proves reachability
-        ok_gh, gh_detail = _probe(RAW_URL)
+        sql_reach, sql_code, _sql_d = _probe(SQLDBM_BASE + "/swagger/v1/swagger.json")
+        gh_reach, gh_code, gh_d = _probe(RAW_URL)
 
-        def line(icon, color, label, detail):
+        marks = {"ok": ("✅", "#137333"), "warn": ("⚠️", "#a60"),
+                 "bad": ("❌", "#c00"), "info": ("ℹ️", "#333")}
+
+        def line(state, label, detail, tip=""):
+            icon, color = marks[state]
+            if tip:
+                label_html = (f"<span title=\"{html.escape(tip)}\" style='cursor:help;"
+                              f"border-bottom:1px dotted #999'><b>{html.escape(label)}</b></span>")
+            else:
+                label_html = f"<b>{html.escape(label)}</b>"
             return (f"<tr><td style='padding:2px 8px'>{icon}</td>"
-                    f"<td style='padding:2px 8px'><b>{html.escape(label)}</b></td>"
+                    f"<td style='padding:2px 8px'>{label_html}</td>"
                     f"<td style='padding:2px 8px;color:{color}'>{html.escape(detail)}</td></tr>")
+
+        # SqlDBM: GET the OpenAPI doc and require HTTP 200 (clearer signal than a 401 on /projects)
+        if sql_code == 200:
+            sql_state, sql_text = "ok", "reachable — API serving (HTTP 200)"
+        elif sql_reach:
+            sql_state, sql_text = "warn", f"reachable but HTTP {sql_code} (proxy or redirect in path?)"
+        else:
+            sql_state, sql_text = "bad", "unreachable"
+        # GitHub raw: require HTTP 200
+        if gh_code == 200:
+            gh_state, gh_text = "ok", "reachable (HTTP 200)"
+        elif gh_reach:
+            gh_state, gh_text = "warn", f"reachable but HTTP {gh_code}"
+        else:
+            gh_state, gh_text = "bad", gh_d
+
         rows = [
-            line("ℹ️", "#333", "Compute", f"{compute} · DBR {dbr}"),
-            line("✅" if uc else "⚠️", "#137333" if uc else "#a60", "Catalogs / UC",
-                 f"{uc_note} · current='{cur}' · [{', '.join(cats) if cats else 'none'}]"),
-            line("✅" if ok_sql else "❌", "#137333" if ok_sql else "#c00",
-                 "SqlDBM API (api.sqldbm.com)", sql_detail),
-            line("✅" if ok_gh else "❌", "#137333" if ok_gh else "#c00",
-                 "Script host (raw.githubusercontent.com)", gh_detail),
+            line("info", "Compute", f"{compute} · DBR {dbr}",
+                 "Cluster type and Databricks Runtime version. 'Classic cluster' = a standard "
+                 "all-purpose / job cluster; 'Serverless / Spark Connect' = serverless compute. "
+                 "This is NOT the metastore — Hive vs Unity Catalog is the Catalogs / UC row below."),
+            line("ok" if uc else "warn", "Catalogs / UC",
+                 f"{uc_note} · current='{cur}' · [{', '.join(cats) if cats else 'none'}]",
+                 "Whether the workspace uses Unity Catalog or is Hive-metastore-only, plus the current "
+                 "catalog and the full SHOW CATALOGS list."),
+            line(sql_state, "SqlDBM API (api.sqldbm.com)", sql_text,
+                 "GETs the SqlDBM OpenAPI doc (/swagger/v1/swagger.json) and expects HTTP 200, confirming "
+                 "this cluster can reach the SqlDBM REST API."),
+            line(gh_state, "Script host (raw.githubusercontent.com)", gh_text,
+                 "Whether this cluster can fetch import.py from the GitHub raw URL the bootstrap uses."),
         ]
         notes = []
         if not uc:
             notes.append("Importing from the Hive metastore catalog — some legacy Hive-SerDe tables may "
                          "not emit DDL via SHOW CREATE TABLE and will be skipped.")
-        if not ok_sql:
+        if sql_state == "bad":
             notes.append("SqlDBM API unreachable — in locked-down / Azure Gov networks, allowlist "
                          "api.sqldbm.com on egress, and confirm sending DDL to the commercial endpoint "
                          "is permitted under your compliance boundary.")
-        if not ok_gh:
+        elif sql_state == "warn":
+            notes.append(f"Reached api.sqldbm.com but got HTTP {sql_code} instead of 200 — an inspecting "
+                         "proxy may be in the path, or the endpoint changed.")
+        if gh_state == "bad":
             notes.append("GitHub raw unreachable — host import.py inside the workspace (Workspace file "
                          "or Repo) instead of fetching it from GitHub.")
+        elif gh_state == "warn":
+            notes.append(f"Reached raw.githubusercontent.com but got HTTP {gh_code} instead of 200 — "
+                         "check the file path / branch in the bootstrap URL.")
         notes_html = ("<ul style='margin:6px 0 0 18px;font-size:12px;color:#555'>"
                       + "".join(f"<li>{html.escape(n)}</li>" for n in notes) + "</ul>") if notes else ""
         display(HTML(
