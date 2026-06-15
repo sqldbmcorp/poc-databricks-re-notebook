@@ -134,10 +134,13 @@ RUN_TS = datetime.now().strftime("%Y%m%d-%H%M%S")
 DEFAULT_BRANCH_NAME = f"databricks-import/{_user_slug}-{RUN_TS}"
 
 # ============================================================ shared state (source side)
-results = []
-combined_ddl = ""
+results = []            # every object generated from the chosen schemas
+selected_results = []   # subset the user kept checked in Step 2
+combined_ddl = ""       # DDL payload built from selected_results only
 catalog = ""
 selected_schemas = []
+_object_rows = []       # [(checkbox, result_dict)]
+_bulk = {"active": False}
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
@@ -161,6 +164,12 @@ generate_btn = widgets.Button(description="Generate DDL", button_style="primary"
                               layout=widgets.Layout(width="220px"))
 source_out   = widgets.Output()
 
+# ============================================================ STEP 2 controls (object picker)
+objects_summary  = widgets.HTML("Generate DDL in Step 1 to list objects.")
+objects_container= widgets.VBox([])
+select_all_btn   = widgets.Button(description="Select all", layout=widgets.Layout(width="110px"))
+select_none_btn  = widgets.Button(description="Deselect all", layout=widgets.Layout(width="110px"))
+
 def on_catalog_change(_=None):
     try:
         schema_sel.options = _list_schemas(catalog_dd.value)
@@ -169,7 +178,7 @@ def on_catalog_change(_=None):
             print(f"Could not list schemas for '{catalog_dd.value}': {e}")
 
 def on_generate(_):
-    global results, combined_ddl, catalog, selected_schemas
+    global results, catalog, selected_schemas
     source_out.clear_output()
     catalog = catalog_dd.value
     selected_schemas = list(schema_sel.value)
@@ -195,13 +204,71 @@ def on_generate(_):
                 except Exception as e:
                     skipped.append((schema, t, str(e).splitlines()[0]))
         results = res
-        combined_ddl = "\n".join(
-            f"-- {r['catalog']}.{r['schema']}.{r['table']}\n{r['ddl']};\n" for r in res)
-        print(f"Generated DDL for {len(res)} table(s) across {len(selected_schemas)} schema(s). "
-              f"{len(skipped)} skipped/failed.")
+        print(f"Found {len(res)} object(s) across {len(selected_schemas)} schema(s). "
+              f"{len(skipped)} skipped/failed. Review and (de)select them in Step 2.")
         for s, t, reason in skipped[:25]:
             print(f"  - skipped {s}.{t}: {reason[:120]}")
+    build_object_rows()
+    recompute_selection()
+
+def _object_kind(ddl):
+    head = (" " + ddl[:80].upper() + " ")
+    if " VIEW " in head:
+        return "VIEW"
+    if " FUNCTION " in head:
+        return "FUNCTION"
+    if " PROCEDURE " in head:
+        return "PROCEDURE"
+    return "TABLE"
+
+def build_object_rows():
+    """Render one selectable row per generated object, grouped by schema, DDL behind a caret."""
+    global _object_rows
+    _object_rows = []
+    if not results:
+        objects_container.children = []
+        return
+    by_schema = {}
+    for r in results:
+        by_schema.setdefault(r["schema"], []).append(r)
+    children = []
+    for schema in sorted(by_schema):
+        children.append(widgets.HTML(
+            f"<div style='font-weight:600;margin:8px 0 2px'>{html.escape(catalog)}.{html.escape(schema)}</div>"))
+        for r in sorted(by_schema[schema], key=lambda x: x["table"].lower()):
+            chk = widgets.Checkbox(value=True, indent=False,
+                                   description=f"{r['table']}   ·   {_object_kind(r['ddl'])}",
+                                   layout=widgets.Layout(width="380px", margin="0"))
+            chk.observe(lambda c: recompute_selection(), names="value")
+            details = widgets.HTML(
+                "<details style='margin:0 0 4px 26px'>"
+                "<summary style='cursor:pointer;font-size:12px;color:#555'>show DDL</summary>"
+                "<div style='max-height:300px;overflow:auto;border:1px solid #ddd;padding:6px;"
+                "font-family:monospace;white-space:pre;font-size:12px;margin-top:4px'>"
+                f"{html.escape(r['ddl'])}</div></details>")
+            _object_rows.append((chk, r))
+            children.append(widgets.VBox([chk, details], layout=widgets.Layout(margin="0")))
+    objects_container.children = children
+
+def recompute_selection(*_):
+    """Rebuild the submission payload from the currently checked objects."""
+    global combined_ddl, selected_results
+    if _bulk["active"]:
+        return
+    selected_results = [r for chk, r in _object_rows if chk.value]
+    combined_ddl = "\n".join(
+        f"-- {r['catalog']}.{r['schema']}.{r['table']}\n{r['ddl']};\n" for r in selected_results)
+    total = len(_object_rows)
+    objects_summary.value = (f"<b>{len(selected_results)}</b> of {total} object(s) selected"
+                             if total else "Generate DDL in Step 1 to list objects.")
     render_review()
+
+def set_all(value):
+    _bulk["active"] = True
+    for chk, _ in _object_rows:
+        chk.value = value
+    _bulk["active"] = False
+    recompute_selection()
 
 # ============================================================ DESTINATION controls
 token_w        = widgets.Password(description="API Token", layout=widgets.Layout(**_W), style=_S)
@@ -251,7 +318,8 @@ def name_conflict():
 def render_review(*_):
     review_out.clear_output()
     with review_out:
-        n = len(results)
+        n = len(selected_results)
+        total = len(results)
         dest = "(choose a project)"
         if project_dd.value == NEW_PROJECT:
             dest = f"NEW project '{new_proj_name.value or '...'}' (dbType={db_type_dd.value})"
@@ -266,14 +334,14 @@ def render_review(*_):
         src = f"{html.escape(catalog)} · schema(s): {html.escape(', '.join(selected_schemas))}" if catalog else "(generate DDL first)"
         display(HTML(
             "<div style='font-family:sans-serif;font-size:13px'>"
-            f"<b>Source:</b> {src} · <b>{n}</b> table(s)<br>"
+            f"<b>Source:</b> {src} · <b>{n}</b> of {total} object(s) selected<br>"
             f"<b>Destination:</b> {html.escape(dest)}<br>"
             f"<b>Revision name:</b> {html.escape(revision_name_w.value)}"
             f"{' · strictMode' if strict_w.value else ''}"
             f"{(' · diagram: ' + html.escape(diagram_w.value)) if diagram_w.value.strip() else ''}"
             f"{warn_html}"
             "<details style='margin-top:8px'>"
-            f"<summary style='cursor:pointer'>Show full DDL ({n} table(s))</summary>"
+            f"<summary style='cursor:pointer'>Show DDL to be submitted ({n} object(s))</summary>"
             "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
             "font-family:monospace;white-space:pre;font-size:12px;margin-top:6px'>"
             f"{html.escape(combined_ddl) or '(no DDL — click Generate DDL)'}</div></details>"
@@ -436,6 +504,8 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 # ============================================================ wire up
 catalog_dd.observe(on_catalog_change, names="value")
 generate_btn.on_click(on_generate)
+select_all_btn.on_click(lambda b: set_all(True))
+select_none_btn.on_click(lambda b: set_all(False))
 connect_btn.on_click(on_connect)
 submit_btn.on_click(on_submit)
 project_dd.observe(on_project_change, names="value")
@@ -457,10 +527,14 @@ refresh_conditional_fields()
 render_review()
 
 display(widgets.VBox([
-    widgets.HTML("<h4 style='margin:4px 0'>1 · Configure Source DDL</h4>"),
+    widgets.HTML("<h4 style='margin:4px 0'>1 · Configure Source Catalog and Schema(s)</h4>"),
     catalog_dd, schema_sel, generate_btn, source_out,
     widgets.HTML("<hr style='margin:10px 0'>"),
-    widgets.HTML("<h4 style='margin:4px 0'>2 · Configure Destination Project</h4>"),
+    widgets.HTML("<h4 style='margin:4px 0'>2 · Configure Objects to Import</h4>"),
+    widgets.HBox([select_all_btn, select_none_btn, objects_summary]),
+    objects_container,
+    widgets.HTML("<hr style='margin:10px 0'>"),
+    widgets.HTML("<h4 style='margin:4px 0'>3 · Configure Destination Project</h4>"),
     widgets.HBox([token_w, connect_btn]), status_out,
     project_dd, new_proj_name, db_type_dd,
     cw_chk, branch_dd, new_branch_w,
