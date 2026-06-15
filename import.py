@@ -14,7 +14,7 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import json, time, html, requests, functools
+import os, json, time, html, requests, functools
 from datetime import datetime
 import ipywidgets as widgets
 from IPython.display import display, HTML
@@ -36,6 +36,8 @@ URL_DBTYPE = {"databricks": "Databricks", "snowflake": "Snowflake", "sqlServer":
               "alloyDB": "AlloyDB", "logical": "Logical"}
 # A branch is addressed by its own id in the same p<id> slot as a project.
 BRANCH_URL_TEMPLATE = "https://app.sqldbm.com/{seg}/DatabaseExplorer/p{branch_id}/"
+# Where this script is hosted (used by the preflight reachability check).
+RAW_URL = "https://raw.githubusercontent.com/sqldbmcorp/poc-databricks-re-notebook/refs/heads/main/import.py"
 
 # ============================================================ SqlDBM API client
 def _headers(token):
@@ -152,7 +154,9 @@ def _list_catalogs():
     return sorted(r[0] for r in spark.sql("SHOW CATALOGS").collect())
 
 def _list_schemas(cat):
-    return sorted(r[0] for r in spark.sql(f"SHOW SCHEMAS IN `{cat}`").collect())
+    # Mirrors the tool's DatabricksGetStructure: set current catalog, then listDatabases().
+    spark.catalog.setCurrentCatalog(cat)
+    return sorted(d.name for d in spark.catalog.listDatabases())
 
 catalog_dd   = widgets.Dropdown(description="Catalog", options=[],
                                 layout=widgets.Layout(**_W), style=_S)
@@ -196,22 +200,29 @@ def on_generate(_):
             print("Select at least one schema, then click Generate DDL.")
             return
         res, skipped = [], []
+        # Mirrors the tool's DatabricksGetDdlFromTerminal: set current catalog, then
+        # listTables(database), skip temporary, SHOW CREATE TABLE per object.
+        try:
+            spark.catalog.setCurrentCatalog(catalog)
+        except Exception as e:
+            print(f"Could not set current catalog '{catalog}': {e}")
+            return
         for schema in selected_schemas:
             try:
-                rows = spark.sql(f"SHOW TABLES IN `{catalog}`.`{schema}`").collect()
+                tbls = spark.catalog.listTables(schema)
             except Exception as e:
                 skipped.append((schema, None, str(e).splitlines()[0]))
                 continue
-            for row in rows:
-                d = row.asDict()
-                t = d.get("tableName") or d.get("table") or row[1]
-                if d.get("isTemporary"):
+            for t in tbls:
+                if t.isTemporary:
                     continue
                 try:
-                    ddl = spark.sql(f"SHOW CREATE TABLE `{catalog}`.`{schema}`.`{t}`").first()[0]
-                    res.append({"catalog": catalog, "schema": schema, "table": t, "ddl": ddl})
+                    # backtick-quoted (the one intentional hardening over the tool's bare names)
+                    ddl = spark.sql(f"SHOW CREATE TABLE `{schema}`.`{t.name}`").first()[0]
+                    res.append({"catalog": catalog, "schema": schema, "table": t.name,
+                                "tableType": getattr(t, "tableType", None), "ddl": ddl})
                 except Exception as e:
-                    skipped.append((schema, t, str(e).splitlines()[0]))
+                    skipped.append((schema, t.name, str(e).splitlines()[0]))
         results = res
         print(f"Found {len(res)} object(s) across {len(selected_schemas)} schema(s). "
               f"{len(skipped)} skipped/failed. Review and (de)select them in Step 2.")
@@ -235,6 +246,10 @@ def _object_kind(ddl):
         return "PROCEDURE"
     return "TABLE"
 
+def _kind(r):
+    # Prefer the authoritative tableType captured from listTables; fall back to DDL inference.
+    return (r.get("tableType") or _object_kind(r["ddl"]))
+
 # ---- selection helpers (operate on the `selected` dict, never on widget state) ----
 def _key(r):
     return f"{r['schema']}.{r['table']}"
@@ -244,7 +259,7 @@ def current_matches():
     q = filter_w.value.strip().lower()
     if not q:
         return results
-    return [r for r in results if q in f"{_key(r)} {_object_kind(r['ddl'])}".lower()]
+    return [r for r in results if q in f"{_key(r)} {_kind(r)}".lower()]
 
 def selected_count():
     return sum(1 for r in results if selected.get(_key(r), False))
@@ -286,7 +301,7 @@ def render_objects(*_):
                 break
             k = _key(r)
             chk = widgets.Checkbox(value=selected.get(k, True), indent=False,
-                                   description=f"{r['table']}   ·   {_object_kind(r['ddl'])}",
+                                   description=f"{r['table']}   ·   {_kind(r)}",
                                    layout=widgets.Layout(width="380px", margin="0"))
             chk.observe(functools.partial(on_toggle, key=k), names="value")
             details = widgets.HTML(
@@ -642,7 +657,88 @@ for _i, _h in enumerate(step_headers):
 
 open_step(0)   # start on Step 1; the rest collapse but their titles remain visible
 
-_rows = []
+# ============================================================ environment preflight
+preflight_btn = widgets.Button(description="Re-run environment checks",
+                               layout=widgets.Layout(width="240px"))
+preflight_out = widgets.Output()
+
+def _probe(url, timeout=5):
+    try:
+        r = requests.get(url, timeout=timeout)
+        return True, f"reachable (HTTP {r.status_code})"
+    except requests.exceptions.SSLError:
+        return False, "TLS/SSL error — likely an inspecting proxy or certificate issue"
+    except requests.exceptions.RequestException as e:
+        return False, f"unreachable ({type(e).__name__})"
+
+def _runtime_info():
+    try:
+        dbr = spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion")
+    except Exception:
+        dbr = os.environ.get("DATABRICKS_RUNTIME_VERSION") or "unknown"
+    compute = "Serverless / Spark Connect" if "connect" in type(spark).__module__ else "Classic cluster"
+    return dbr, compute
+
+def _catalog_info():
+    try:
+        cats = sorted(r[0] for r in spark.sql("SHOW CATALOGS").collect())
+    except Exception as e:
+        return "?", [], False, f"SHOW CATALOGS failed: {str(e).splitlines()[0][:80]}"
+    try:
+        cur = spark.catalog.currentCatalog()
+    except Exception:
+        cur = "?"
+    uc = ("system" in cats) or ("hive_metastore" in cats) or \
+         any(c not in {"spark_catalog", "samples", "hive_metastore"} for c in cats)
+    note = "Unity Catalog appears ENABLED" if uc else "No Unity Catalog detected (Hive metastore only)"
+    return cur, cats, uc, note
+
+def run_preflight(_=None):
+    preflight_out.clear_output()
+    with preflight_out:
+        dbr, compute = _runtime_info()
+        cur, cats, uc, uc_note = _catalog_info()
+        ok_sql, sql_detail = _probe(SQLDBM_BASE + "/projects")   # 401 still proves reachability
+        ok_gh, gh_detail = _probe(RAW_URL)
+
+        def line(icon, color, label, detail):
+            return (f"<tr><td style='padding:2px 8px'>{icon}</td>"
+                    f"<td style='padding:2px 8px'><b>{html.escape(label)}</b></td>"
+                    f"<td style='padding:2px 8px;color:{color}'>{html.escape(detail)}</td></tr>")
+        rows = [
+            line("ℹ️", "#333", "Compute", f"{compute} · DBR {dbr}"),
+            line("✅" if uc else "⚠️", "#137333" if uc else "#a60", "Catalogs / UC",
+                 f"{uc_note} · current='{cur}' · [{', '.join(cats) if cats else 'none'}]"),
+            line("✅" if ok_sql else "❌", "#137333" if ok_sql else "#c00",
+                 "SqlDBM API (api.sqldbm.com)", sql_detail),
+            line("✅" if ok_gh else "❌", "#137333" if ok_gh else "#c00",
+                 "Script host (raw.githubusercontent.com)", gh_detail),
+        ]
+        notes = []
+        if not uc:
+            notes.append("Importing from the Hive metastore catalog — some legacy Hive-SerDe tables may "
+                         "not emit DDL via SHOW CREATE TABLE and will be skipped.")
+        if not ok_sql:
+            notes.append("SqlDBM API unreachable — in locked-down / Azure Gov networks, allowlist "
+                         "api.sqldbm.com on egress, and confirm sending DDL to the commercial endpoint "
+                         "is permitted under your compliance boundary.")
+        if not ok_gh:
+            notes.append("GitHub raw unreachable — host import.py inside the workspace (Workspace file "
+                         "or Repo) instead of fetching it from GitHub.")
+        notes_html = ("<ul style='margin:6px 0 0 18px;font-size:12px;color:#555'>"
+                      + "".join(f"<li>{html.escape(n)}</li>" for n in notes) + "</ul>") if notes else ""
+        display(HTML(
+            "<div style='font-family:sans-serif;font-size:13px'>"
+            f"<table style='border-collapse:collapse'>{''.join(rows)}</table>{notes_html}</div>"))
+
+preflight_btn.on_click(run_preflight)
+run_preflight()   # auto-run once at load
+
+_rows = [
+    widgets.HTML("<h4 style='margin:4px 0'>Environment preflight</h4>"),
+    preflight_btn, preflight_out,
+    widgets.HTML("<hr style='margin:10px 0'>"),
+]
 for _h, _c in zip(step_headers, step_contents):
     _rows.append(_h)
     _rows.append(_c)
