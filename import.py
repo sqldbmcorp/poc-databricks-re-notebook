@@ -144,6 +144,7 @@ RENDER_CAP = 300        # max checkbox rows rendered at once; filter to reach th
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
+SELECT_BRANCH = "— select a branch —"
 LATEST = "Create revision on latest"
 _state = {"projects": {}, "branch_ids": {}, "revision_ids": {}}
 _W = {"width": "420px"}
@@ -163,40 +164,55 @@ catalog_dd   = widgets.Dropdown(description="Catalog", options=[],
 schema_sel   = widgets.SelectMultiple(description="Schema(s)", options=[], rows=8,
                                       layout=widgets.Layout(**_W), style=_S)
 generate_btn = widgets.Button(description="Generate DDL", button_style="primary",
-                              layout=widgets.Layout(width="220px"))
+                              layout=widgets.Layout(width="220px", margin="10px 130px"))
 source_out   = widgets.Output()
 
 # ============================================================ STEP 2 controls (object picker)
-filter_w         = widgets.Text(description="Filter", placeholder="name contains… (e.g. fact_, dim_, schema.table) — press Enter",
-                                continuous_update=False, layout=widgets.Layout(width="420px"), style=_S)
+filter_w         = widgets.Text(description="Filter", placeholder="name contains… (e.g. fact_, dim_, schema.table)",
+                                continuous_update=False, layout=widgets.Layout(width="340px"), style=_S)
+filter_btn       = widgets.Button(description="Apply", layout=widgets.Layout(width="80px"))
 objects_summary  = widgets.HTML("Generate DDL in Step 1 to list objects.")
-objects_container= widgets.VBox([])
+objects_container= widgets.VBox([], layout=widgets.Layout(margin="0 0 0 128px"))
 options_label    = widgets.Label("Options", layout=widgets.Layout(width="120px", display="flex",
                                                                   justify_content="flex-end"))
 select_all_btn   = widgets.Button(description="Select all", layout=widgets.Layout(width="140px"))
 select_none_btn  = widgets.Button(description="Deselect all", layout=widgets.Layout(width="140px"))
+step2_back_btn   = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
 continue_btn     = widgets.Button(description="Preview DDL to Continue ▸", button_style="primary",
                                   layout=widgets.Layout(width="240px"))
 continue_status  = widgets.HTML("")
 # ---- Step 3 (DDL confirmation) ----
 preview_out      = widgets.Output()
+back_btn         = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
 confirm_btn      = widgets.Button(description="Confirm & Configure Destination ▸", button_style="success",
                                   layout=widgets.Layout(width="280px"))
 
 def on_catalog_change(_=None):
+    schema_sel.options = ["⏳ Loading schemas…"]
+    schema_sel.disabled = True
     try:
         schema_sel.options = _list_schemas(catalog_dd.value)
     except Exception as e:
+        schema_sel.options = []
         with source_out:
             print(f"Could not list schemas for '{catalog_dd.value}': {e}")
+    finally:
+        schema_sel.disabled = False
 
 def on_generate(_):
     global results, catalog, selected_schemas
     source_out.clear_output()
+    generate_btn.disabled = True
+    generate_btn.description = "Generating…"
+    with source_out:
+        display(HTML("<div style='font-size:13px;color:#555'>⏳ Generating DDL…</div>"))
     catalog = catalog_dd.value
     selected_schemas = list(schema_sel.value)
+    source_out.clear_output()
     with source_out:
         if not selected_schemas:
+            generate_btn.disabled = False
+            generate_btn.description = "Generate DDL"
             print("Select at least one schema, then click Generate DDL.")
             return
         res, skipped = [], []
@@ -205,6 +221,8 @@ def on_generate(_):
         try:
             spark.catalog.setCurrentCatalog(catalog)
         except Exception as e:
+            generate_btn.disabled = False
+            generate_btn.description = "Generate DDL"
             print(f"Could not set current catalog '{catalog}': {e}")
             return
         for schema in selected_schemas:
@@ -228,6 +246,8 @@ def on_generate(_):
               f"{len(skipped)} skipped/failed. Review and (de)select them in Step 2.")
         for s, t, reason in skipped[:25]:
             print(f"  - skipped {s}.{t}: {reason[:120]}")
+    generate_btn.disabled = False
+    generate_btn.description = "Generate DDL"
     global selected
     selected = {_key(r): True for r in results}   # default: everything selected
     filter_w.value = ""
@@ -358,10 +378,9 @@ project_dd     = widgets.Dropdown(options=[], description="Project", disabled=Tr
                                   layout=widgets.Layout(**_W), style=_S)
 new_proj_name  = widgets.Text(description="New name", placeholder="Unique project name",
                               layout=widgets.Layout(**_W), style=_S)
-db_type_dd     = widgets.Dropdown(options=DB_TYPES, value="databricks", description="dbType",
-                                  layout=widgets.Layout(width="300px"), style=_S)
 cw_chk         = widgets.Checkbox(value=False, indent=False,
-                                  description="Concurrent-Working project (route via a branch)")
+                                  description="Concurrent-Working project (route via a branch)",
+                                  layout=widgets.Layout(margin="0px 130px"))
 branch_dd      = widgets.Dropdown(options=[], description="Branch",
                                   layout=widgets.Layout(**_W), style=_S)
 new_branch_w   = widgets.Text(value=DEFAULT_BRANCH_NAME, description="Branch name",
@@ -370,11 +389,12 @@ update_dd      = widgets.Dropdown(options=[LATEST], value=LATEST, description="U
                                   layout=widgets.Layout(**_W), style=_S)
 revision_name_w= widgets.Text(value=f"Databricks import {RUN_TS}", description="Revision name",
                               layout=widgets.Layout(**_W), style=_S)
-diagram_w      = widgets.Text(value="", description="Diagram",
+diagram_w      = widgets.Text(value="Reverse engineer", description="Diagram",
                               placeholder="(optional) place objects on a diagram",
                               layout=widgets.Layout(**_W), style=_S)
 strict_w       = widgets.Checkbox(value=False, indent=False,
-                                  description="strictMode (override another user's lock)")
+                                  description="strictMode (override another user's lock)",
+                                  layout=widgets.Layout(margin="0px 130px"))
 submit_btn     = widgets.Button(description="Submit to SqlDBM", button_style="success",
                                 disabled=True, layout=widgets.Layout(width="220px"))
 status_out     = widgets.Output()
@@ -402,12 +422,16 @@ def render_review(*_):
         total = len(results)
         dest = "(choose a project)"
         if project_dd.value == NEW_PROJECT:
-            dest = f"NEW project '{new_proj_name.value or '...'}' (dbType={db_type_dd.value})"
+            dest = f"NEW project '{new_proj_name.value or '...'}' (dbType=databricks)"
         elif project_dd.value:
             dest = f"{project_dd.value}"
             if cw_chk.value:
-                b = new_branch_w.value if branch_dd.value == NEW_BRANCH else branch_dd.value
-                dest += f"  ·  branch: {b}"
+                if branch_dd.value == SELECT_BRANCH:
+                    dest += "  ·  branch: (none selected)"
+                elif branch_dd.value == NEW_BRANCH:
+                    dest += f"  ·  branch: {new_branch_w.value}"
+                else:
+                    dest += f"  ·  branch: {branch_dd.value}"
             dest += f"  ·  {update_dd.value}"
         warn = name_conflict()
         warn_html = f"<div style='color:#c00;margin-top:4px'>⚠ {html.escape(warn)}</div>" if warn else ""
@@ -420,19 +444,20 @@ def render_review(*_):
             f"{' · strictMode' if strict_w.value else ''}"
             f"{(' · diagram: ' + html.escape(diagram_w.value)) if diagram_w.value.strip() else ''}"
             f"{warn_html}"
-            "<div style='margin-top:6px;color:#777;font-size:12px'>Use “Preview DDL” in Step 2 to see the exact payload.</div>"
+            "<div style='margin-top:6px;color:#777;font-size:12px'>Use “DDL Confirmation” in Step 3 to see the exact payload.</div>"
             "</div>"))
-    submit_btn.disabled = (not bool(project_dd.value)) or bool(name_conflict()) or (selected_count() == 0)
+    needs_branch = cw_chk.value and branch_dd.value == SELECT_BRANCH
+    submit_btn.disabled = (not bool(project_dd.value)) or bool(name_conflict()) or (selected_count() == 0) or needs_branch
 
 def refresh_conditional_fields():
     is_new = project_dd.value == NEW_PROJECT
     _set(new_proj_name, is_new)
-    _set(db_type_dd, is_new)
     _set(cw_chk, not is_new and bool(project_dd.value))
     show_branch = (not is_new) and cw_chk.value
     _set(branch_dd, show_branch)
     _set(new_branch_w, show_branch and branch_dd.value == NEW_BRANCH)
-    _set(update_dd, (not is_new) and bool(project_dd.value))
+    branch_chosen = not cw_chk.value or branch_dd.value not in (SELECT_BRANCH, NEW_BRANCH)
+    _set(update_dd, (not is_new) and bool(project_dd.value) and branch_chosen)
 
 def load_project_context(project_id):
     token = token_w.value.strip()
@@ -443,26 +468,15 @@ def load_project_context(project_id):
     _state["branch_names"] = {str(b.get("branchName", "")).strip().lower() for b in branches}
     labels = []
     for b in sorted(branches, key=lambda x: str(x.get("branchName", "")).lower()):
-        label = b.get("branchName", "?") + ("  (main)" if b.get("isMain") else "")
+        if b.get("isMain"):
+            continue
+        label = b.get("branchName", "?")
         _state["branch_ids"][label] = b.get("branchId")
         labels.append(label)
-    branch_dd.options = [NEW_BRANCH] + labels
-    branch_dd.value = next((o for o in labels if "(main)" not in o), NEW_BRANCH)
+    branch_dd.options = [SELECT_BRANCH, NEW_BRANCH] + labels
+    branch_dd.value = SELECT_BRANCH
     _state["revision_ids"] = {}
-    revs = []
-    for rv in list_revisions(token, project_id):
-        rid = rv.get("revisionId") or rv.get("id")
-        if rid is None:
-            continue
-        num = rv.get("revNumber") or rv.get("number") or rid
-        nm = rv.get("revName") or rv.get("name") or ""
-        revs.append((num, rid, nm))
-    rev_opts = [LATEST]
-    for num, rid, nm in sorted(revs, key=lambda t: (t[0] if isinstance(t[0], int) else 0), reverse=True):
-        label = f"From revision {num}: {nm}".strip()
-        _state["revision_ids"][label] = rid
-        rev_opts.append(label)
-    update_dd.options = rev_opts
+    update_dd.options = [LATEST]
     update_dd.value = LATEST
 
 def on_connect(_):
@@ -520,7 +534,7 @@ def on_submit(_):
                 if not created_name:
                     print("Enter a name for the new project."); return
                 print(f"Creating new project '{created_name}' ...")
-                r = create_project(token, created_name, payload, db_type_dd.value, rev_name, diagram)
+                r = create_project(token, created_name, payload, "databricks", rev_name, diagram)
             else:
                 pid = _state["projects"][project_dd.value]
                 branch_id = None
@@ -550,7 +564,7 @@ def on_submit(_):
                     if is_new:
                         new_id = wait_for_project(token, created_name)
                         if new_id:
-                            seg = get_project_dbtype(token, new_id) or URL_DBTYPE.get(db_type_dd.value, db_type_dd.value)
+                            seg = get_project_dbtype(token, new_id) or URL_DBTYPE.get("databricks", "databricks")
                             _show_links(seg, new_id)
                         else:
                             print("New project accepted but not queryable yet — open SqlDBM to find it shortly.")
@@ -568,6 +582,35 @@ def on_submit(_):
         except Exception as e:
             print(f"Error: {e}")
 
+def refresh_revisions_for_branch(_=None):
+    if not project_dd.value or project_dd.value == NEW_PROJECT:
+        return
+    if branch_dd.value in (NEW_BRANCH, SELECT_BRANCH):
+        return
+    token = token_w.value.strip()
+    if not token:
+        return
+    project_id = _state["projects"].get(project_dd.value)
+    if not project_id:
+        return
+    branch_id = _state["branch_ids"].get(branch_dd.value)
+    _state["revision_ids"] = {}
+    revs = []
+    for rv in list_revisions(token, project_id, branch_id):
+        rid = rv.get("revisionId") or rv.get("id")
+        if rid is None:
+            continue
+        num = rv.get("revNumber") or rv.get("number") or rid
+        nm = rv.get("revName") or rv.get("name") or ""
+        revs.append((num, rid, nm))
+    rev_opts = [LATEST]
+    for num, rid, nm in sorted(revs, key=lambda t: (t[0] if isinstance(t[0], int) else 0), reverse=True):
+        label = f"From revision {num}: {nm}".strip()
+        _state["revision_ids"][label] = rid
+        rev_opts.append(label)
+    update_dd.options = rev_opts
+    update_dd.value = LATEST
+
 def _link_html(label, url):
     return (f"<div style='margin-top:6px'>🔗 <b>{html.escape(label)}:</b> "
             f"<a href='{html.escape(url)}' target='_blank'>{html.escape(url)}</a></div>")
@@ -582,16 +625,19 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 catalog_dd.observe(on_catalog_change, names="value")
 generate_btn.on_click(on_generate)
 filter_w.observe(render_objects, names="value")
+filter_btn.on_click(lambda _: render_objects())
 select_all_btn.on_click(lambda b: set_all_filtered(True))
 select_none_btn.on_click(lambda b: set_all_filtered(False))
+step2_back_btn.on_click(lambda _: open_step(0))
 continue_btn.on_click(on_preview_continue)
+back_btn.on_click(lambda _: open_step(1))
 confirm_btn.on_click(on_confirm)
 connect_btn.on_click(on_connect)
 submit_btn.on_click(on_submit)
 project_dd.observe(on_project_change, names="value")
 cw_chk.observe(lambda c: (refresh_conditional_fields(), render_review()), names="value")
-branch_dd.observe(lambda c: (refresh_conditional_fields(), render_review()), names="value")
-for _w in (new_proj_name, db_type_dd, update_dd, revision_name_w, diagram_w, strict_w, new_branch_w):
+branch_dd.observe(lambda c: (refresh_conditional_fields(), refresh_revisions_for_branch(), render_review()), names="value")
+for _w in (new_proj_name, update_dd, revision_name_w, diagram_w, strict_w, new_branch_w):
     _w.observe(render_review, names="value")
 
 # ============================================================ initialize + render
@@ -614,18 +660,18 @@ STEP_TITLES = [
 ]
 _step1 = widgets.VBox([catalog_dd, schema_sel, generate_btn, source_out])
 _step2 = widgets.VBox([
-    widgets.HBox([filter_w, continue_btn, continue_status]),
+    widgets.HBox([step2_back_btn, continue_btn, continue_status]),
+    widgets.HBox([filter_w, filter_btn]),
     widgets.HBox([options_label, select_all_btn, select_none_btn, objects_summary]),
     objects_container,
 ])
 _step3 = widgets.VBox([
-    widgets.HTML("<div style='font-size:13px'>Confirm the DDL below is what you want to import, "
-                 "then continue to choose the destination.</div>"),
-    preview_out, confirm_btn,
+    widgets.HBox([back_btn, confirm_btn]),
+    preview_out,
 ])
 _step4 = widgets.VBox([
     widgets.HBox([token_w, connect_btn]), status_out,
-    project_dd, new_proj_name, db_type_dd,
+    project_dd, new_proj_name,
     cw_chk, branch_dd, new_branch_w,
     update_dd, revision_name_w, diagram_w, strict_w,
     widgets.HTML("<hr style='margin:8px 0'>"),
