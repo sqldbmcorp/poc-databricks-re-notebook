@@ -7,7 +7,7 @@ Run from a Databricks notebook cell:
     url = "https://raw.githubusercontent.com/sqldbmcorp/poc-databricks-re-notebook/refs/heads/main/import.py"
     exec(compile(urllib.request.urlopen(url).read().decode(), "import.py", "exec"), globals())
 
-Renders one form: pick a source catalog + schema(s), Generate DDL, then configure the
+Renders one form: pick a source catalog + schema(s), list objects, select them, generate DDL, then configure the
 SqlDBM destination (token, project/branch/revision), review, and Submit.
 
 Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, and outbound
@@ -136,8 +136,9 @@ RUN_TS = datetime.now().strftime("%Y%m%d-%H%M%S")
 DEFAULT_BRANCH_NAME = f"databricks-import/{_user_slug}-{RUN_TS}"
 
 # ============================================================ shared state (source side)
-results = []            # every object generated from the chosen schemas
+results = []            # every object listed from the chosen schemas (ddl populated in step 2)
 selected = {}           # object_key -> bool  (selection lives here, NOT in widgets, so it scales)
+_schema_headers = {}    # schema -> (widgets.HTML, objs_list) — live header widgets for dynamic counts
 catalog = ""
 selected_schemas = []
 RENDER_CAP = 300        # max checkbox rows rendered at once; filter to reach the rest
@@ -163,7 +164,7 @@ catalog_dd   = widgets.Dropdown(description="Catalog", options=[],
                                 layout=widgets.Layout(**_W), style=_S)
 schema_sel   = widgets.SelectMultiple(description="Schema(s)", options=[], rows=8,
                                       layout=widgets.Layout(**_W), style=_S)
-generate_btn = widgets.Button(description="Generate DDL", button_style="primary",
+generate_btn = widgets.Button(description="List Objects", button_style="primary",
                               layout=widgets.Layout(width="220px", margin="10px 130px"))
 source_out   = widgets.Output()
 
@@ -171,15 +172,15 @@ source_out   = widgets.Output()
 filter_w         = widgets.Text(description="Filter", placeholder="name contains… (e.g. fact_, dim_, schema.table)",
                                 continuous_update=False, layout=widgets.Layout(width="340px"), style=_S)
 filter_btn       = widgets.Button(description="Apply", layout=widgets.Layout(width="80px"))
-objects_summary  = widgets.HTML("Generate DDL in Step 1 to list objects.")
+objects_summary  = widgets.HTML("List objects in Step 1 to populate this list.")
 objects_container= widgets.VBox([], layout=widgets.Layout(margin="0 0 0 128px"))
 options_label    = widgets.Label("Options", layout=widgets.Layout(width="120px", display="flex",
                                                                   justify_content="flex-end"))
 select_all_btn   = widgets.Button(description="Select all", layout=widgets.Layout(width="140px"))
 select_none_btn  = widgets.Button(description="Deselect all", layout=widgets.Layout(width="140px"))
 step2_back_btn   = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
-continue_btn     = widgets.Button(description="Preview DDL to Continue ▸", button_style="primary",
-                                  layout=widgets.Layout(width="240px"))
+continue_btn     = widgets.Button(description="Generate DDL for Selected ▸", button_style="primary",
+                                  layout=widgets.Layout(width="260px"))
 continue_status  = widgets.HTML("")
 # ---- Step 3 (DDL confirmation) ----
 preview_out      = widgets.Output()
@@ -199,80 +200,101 @@ def on_catalog_change(_=None):
     finally:
         schema_sel.disabled = False
 
-def on_generate(_):
+def _kind_from_tabletype(table_type):
+    tt = (table_type or "").upper()
+    if tt == "VIEW":
+        return "VIEW"
+    if tt == "STREAMING_TABLE":
+        return "STREAMING TABLE"
+    if tt == "MATERIALIZED_VIEW":
+        return "MATERIALIZED VIEW"
+    return "TABLE"
+
+def _list_user_functions(cat, schema):
+    """Return bare function names for user-defined functions in catalog.schema."""
+    try:
+        rows = spark.sql(f"SHOW USER FUNCTIONS IN `{cat}`.`{schema}`").collect()
+        return [row[0].rsplit(".", 1)[-1] for row in rows]
+    except Exception:
+        try:
+            rows = spark.sql(f"SHOW USER FUNCTIONS IN `{schema}`").collect()
+            return [row[0].rsplit(".", 1)[-1] for row in rows]
+        except Exception:
+            return []
+
+def _show_create(r):
+    """Run the appropriate SHOW CREATE statement for the object."""
+    cat, sch, name, kind = r["catalog"], r["schema"], r["name"], r["kind"]
+    if kind == "FUNCTION":
+        try:
+            return spark.sql(f"SHOW CREATE FUNCTION `{cat}`.`{sch}`.`{name}`").first()[0]
+        except Exception:
+            return spark.sql(f"SHOW CREATE FUNCTION `{sch}`.`{name}`").first()[0]
+    else:
+        return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
+
+def on_list_objects(_):
     global results, catalog, selected_schemas
     source_out.clear_output()
     generate_btn.disabled = True
-    generate_btn.description = "Generating…"
+    generate_btn.description = "Listing…"
     with source_out:
-        display(HTML("<div style='font-size:13px;color:#555'>⏳ Generating DDL…</div>"))
+        display(HTML("<div style='font-size:13px;color:#555'>⏳ Listing objects…</div>"))
     catalog = catalog_dd.value
     selected_schemas = list(schema_sel.value)
     source_out.clear_output()
     with source_out:
         if not selected_schemas:
             generate_btn.disabled = False
-            generate_btn.description = "Generate DDL"
-            print("Select at least one schema, then click Generate DDL.")
+            generate_btn.description = "List Objects"
+            print("Select at least one schema, then click List Objects.")
             return
         res, skipped = [], []
-        # Mirrors the tool's DatabricksGetDdlFromTerminal: set current catalog, then
-        # listTables(database), skip temporary, SHOW CREATE TABLE per object.
+        # Mirrors the tool's DatabricksGetStructure: set current catalog, then
+        # listTables(database), skip temporary tables, and list user functions.
         try:
             spark.catalog.setCurrentCatalog(catalog)
         except Exception as e:
             generate_btn.disabled = False
-            generate_btn.description = "Generate DDL"
+            generate_btn.description = "List Objects"
             print(f"Could not set current catalog '{catalog}': {e}")
             return
         for schema in selected_schemas:
             try:
                 tbls = spark.catalog.listTables(schema)
             except Exception as e:
-                skipped.append((schema, None, str(e).splitlines()[0]))
+                skipped.append((schema, str(e).splitlines()[0]))
                 continue
             for t in tbls:
                 if t.isTemporary:
                     continue
-                try:
-                    # backtick-quoted (the one intentional hardening over the tool's bare names)
-                    ddl = spark.sql(f"SHOW CREATE TABLE `{schema}`.`{t.name}`").first()[0]
-                    res.append({"catalog": catalog, "schema": schema, "table": t.name,
-                                "tableType": getattr(t, "tableType", None), "ddl": ddl})
-                except Exception as e:
-                    skipped.append((schema, t.name, str(e).splitlines()[0]))
+                res.append({"catalog": catalog, "schema": schema, "name": t.name,
+                            "kind": _kind_from_tabletype(getattr(t, "tableType", None)),
+                            "ddl": None})
+            for fn in _list_user_functions(catalog, schema):
+                res.append({"catalog": catalog, "schema": schema, "name": fn,
+                            "kind": "FUNCTION", "ddl": None})
         results = res
         print(f"Found {len(res)} object(s) across {len(selected_schemas)} schema(s). "
-              f"{len(skipped)} skipped/failed. Review and (de)select them in Step 2.")
-        for s, t, reason in skipped[:25]:
-            print(f"  - skipped {s}.{t}: {reason[:120]}")
+              f"{len(skipped)} schema(s) failed. Select objects in Step 2, then generate DDL.")
+        for s, reason in skipped[:25]:
+            print(f"  - skipped {s}: {reason[:120]}")
     generate_btn.disabled = False
-    generate_btn.description = "Generate DDL"
+    generate_btn.description = "List Objects"
     global selected
-    selected = {_key(r): True for r in results}   # default: everything selected
+    selected = {_key(r): True for r in results}
     filter_w.value = ""
     render_objects()
     update_counts()
     if results:
-        open_step(1)   # collapse Step 1, open Step 2
-
-def _object_kind(ddl):
-    head = (" " + ddl[:80].upper() + " ")
-    if " VIEW " in head:
-        return "VIEW"
-    if " FUNCTION " in head:
-        return "FUNCTION"
-    if " PROCEDURE " in head:
-        return "PROCEDURE"
-    return "TABLE"
+        open_step(1)
 
 def _kind(r):
-    # Prefer the authoritative tableType captured from listTables; fall back to DDL inference.
-    return (r.get("tableType") or _object_kind(r["ddl"]))
+    return r.get("kind") or "TABLE"
 
 # ---- selection helpers (operate on the `selected` dict, never on widget state) ----
 def _key(r):
-    return f"{r['schema']}.{r['table']}"
+    return f"{r['schema']}.{r['name']}"
 
 def current_matches():
     """Objects matching the filter box (case-insensitive substring on schema.table · kind)."""
@@ -285,8 +307,8 @@ def selected_count():
     return sum(1 for r in results if selected.get(_key(r), False))
 
 def build_payload():
-    return "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['table']}\n{r['ddl']};\n"
-                     for r in results if selected.get(_key(r), False))
+    return "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n"
+                     for r in results if selected.get(_key(r), False) and r.get("ddl"))
 
 def on_toggle(change, key):
     selected[key] = change["new"]
@@ -296,41 +318,54 @@ def update_counts(*_):
     """Cheap: refresh counters + the destination review. Does NOT build the DDL payload."""
     total = len(results)
     objects_summary.value = (f"<b>{selected_count()}</b> of {total} object(s) selected"
-                             if total else "Generate DDL in Step 1 to list objects.")
+                             if total else "List objects in Step 1 to populate this list.")
+    for schema, (hdr, objs) in _schema_headers.items():
+        sel_n = sum(1 for r in objs if selected.get(_key(r), False))
+        hdr.value = (f"<div style='font-weight:600;margin:8px 0 2px'>"
+                     f"{html.escape(catalog)}.{html.escape(schema)} "
+                     f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>")
     render_review()
 
 def render_objects(*_):
     """Render only the filtered slice, capped at RENDER_CAP rows, grouped by schema."""
+    global _schema_headers
     if not results:
         objects_container.children = []
+        _schema_headers = {}
         return
     matches = current_matches()
     by_schema = {}
     for r in matches:
         by_schema.setdefault(r["schema"], []).append(r)
+    _schema_headers = {}
     children, shown, capped = [], 0, False
     for schema in sorted(by_schema):
-        objs = sorted(by_schema[schema], key=lambda x: x["table"].lower())
+        objs = sorted(by_schema[schema], key=lambda x: x["name"].lower())
         sel_n = sum(1 for r in objs if selected.get(_key(r), False))
-        children.append(widgets.HTML(
+        hdr = widgets.HTML(
             f"<div style='font-weight:600;margin:8px 0 2px'>{html.escape(catalog)}.{html.escape(schema)} "
-            f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>"))
+            f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>")
+        _schema_headers[schema] = (hdr, objs)
+        children.append(hdr)
         for r in objs:
             if shown >= RENDER_CAP:
                 capped = True
                 break
             k = _key(r)
             chk = widgets.Checkbox(value=selected.get(k, True), indent=False,
-                                   description=f"{r['table']}   ·   {_kind(r)}",
+                                   description=f"{r['name']}   ·   {_kind(r)}",
                                    layout=widgets.Layout(width="380px", margin="0"))
             chk.observe(functools.partial(on_toggle, key=k), names="value")
-            details = widgets.HTML(
-                "<details style='margin:0 0 4px 26px'>"
-                "<summary style='cursor:pointer;font-size:12px;color:#555'>show DDL</summary>"
-                "<div style='max-height:300px;overflow:auto;border:1px solid #ddd;padding:6px;"
-                "font-family:monospace;white-space:pre;font-size:12px;margin-top:4px'>"
-                f"{html.escape(r['ddl'])}</div></details>")
-            children.append(widgets.VBox([chk, details], layout=widgets.Layout(margin="0")))
+            row_widgets = [chk]
+            if r.get("ddl"):
+                details = widgets.HTML(
+                    "<details style='margin:0 0 4px 26px'>"
+                    "<summary style='cursor:pointer;font-size:12px;color:#555'>show DDL</summary>"
+                    "<div style='max-height:300px;overflow:auto;border:1px solid #ddd;padding:6px;"
+                    "font-family:monospace;white-space:pre;font-size:12px;margin-top:4px'>"
+                    f"{html.escape(r['ddl'])}</div></details>")
+                row_widgets.append(details)
+            children.append(widgets.VBox(row_widgets, layout=widgets.Layout(margin="0")))
             shown += 1
         if capped:
             break
@@ -349,15 +384,40 @@ def set_all_filtered(value):
     update_counts()
 
 def on_preview_continue(_):
-    """Step 2 -> Step 3: render the selected DDL into the confirmation panel and open it."""
+    """Step 2 -> Step 3: generate DDL for any newly selected objects, then show the confirmation panel."""
     continue_status.value = ""
     if selected_count() == 0:
         continue_status.value = "<span style='color:#c00'>Select at least one object to continue.</span>"
         return
+    to_generate = [r for r in results if selected.get(_key(r), False) and r["ddl"] is None]
+    if to_generate:
+        continue_btn.disabled = True
+        continue_btn.description = "Generating DDL…"
+        skipped = []
+        for i, r in enumerate(to_generate, 1):
+            continue_status.value = f"<span style='color:#555'>⏳ Generating DDL… {i}/{len(to_generate)}</span>"
+            try:
+                r["ddl"] = _show_create(r)
+            except Exception as e:
+                skipped.append((_key(r), str(e).splitlines()[0]))
+        continue_btn.disabled = False
+        continue_btn.description = "Generate DDL for Selected ▸"
+        if skipped:
+            continue_status.value = (f"<span style='color:#a60'>⚠ {len(skipped)} object(s) failed DDL "
+                                     f"generation and will be excluded from the payload.</span>")
+            with source_out:
+                for k, reason in skipped[:25]:
+                    print(f"  - DDL generation failed for {k}: {reason[:120]}")
+        else:
+            continue_status.value = ""
+        render_objects()   # reveal "show DDL" expanders for newly generated objects
     preview_out.clear_output()
     with preview_out:
-        n = selected_count()
         payload = build_payload()
+        if not payload:
+            display(HTML("<div style='color:#c00'>No DDL was successfully generated for the selected objects.</div>"))
+            return
+        n = sum(1 for r in results if selected.get(_key(r), False) and r.get("ddl"))
         display(HTML(
             f"<div style='font-size:12px;color:#555;margin-bottom:4px'>"
             f"DDL for <b>{n}</b> selected object(s) — review, then confirm:</div>"
@@ -435,7 +495,7 @@ def render_review(*_):
             dest += f"  ·  {update_dd.value}"
         warn = name_conflict()
         warn_html = f"<div style='color:#c00;margin-top:4px'>⚠ {html.escape(warn)}</div>" if warn else ""
-        src = f"{html.escape(catalog)} · schema(s): {html.escape(', '.join(selected_schemas))}" if catalog else "(generate DDL first)"
+        src = f"{html.escape(catalog)} · schema(s): {html.escape(', '.join(selected_schemas))}" if catalog else "(list objects first)"
         display(HTML(
             "<div style='font-family:sans-serif;font-size:13px'>"
             f"<b>Source:</b> {src} · <b>{n}</b> of {total} object(s) selected<br>"
@@ -518,7 +578,7 @@ def on_submit(_):
         if not token:
             print("Enter your API token."); return
         if selected_count() == 0:
-            print("No objects selected — generate DDL and select objects in Step 2 first."); return
+            print("No objects selected — list objects and select them in Step 2 first."); return
         payload = build_payload()
         conflict = name_conflict()
         if conflict:
@@ -623,7 +683,7 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 
 # ============================================================ wire up
 catalog_dd.observe(on_catalog_change, names="value")
-generate_btn.on_click(on_generate)
+generate_btn.on_click(on_list_objects)
 filter_w.observe(render_objects, names="value")
 filter_btn.on_click(lambda _: render_objects())
 select_all_btn.on_click(lambda b: set_all_filtered(True))
@@ -653,8 +713,8 @@ refresh_conditional_fields()
 render_review()
 
 STEP_TITLES = [
-    "1 · Configure Source Catalog and Schema(s)",
-    "2 · Configure Objects to Import",
+    "1 · Select Catalog and Schema(s)",
+    "2 · Select Objects and Generate DDL",
     "3 · DDL Confirmation",
     "4 · Configure Destination Project",
 ]
